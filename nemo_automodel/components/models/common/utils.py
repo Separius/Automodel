@@ -269,13 +269,36 @@ class BackendConfig:
             )
 
 
-@torch.compile(fullgraph=True, dynamic=True)
-def _float32_rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Compiled fp32 RMSNorm forward — standalone function to minimize dynamo guards."""
+def _float32_rms_norm_eager(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Numerically stable fp32 RMSNorm implementation shared by both paths."""
     input_dtype = x.dtype
     x = x.float()
     x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
     return (weight * x).to(input_dtype)
+
+
+_float32_rms_norm_compiled = torch.compile(
+    _float32_rms_norm_eager,
+    fullgraph=True,
+    dynamic=True,
+)
+_float32_rms_norm_compile_failed = False
+
+
+def _float32_rms_norm_fwd(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Use compiled RMSNorm until Inductor rejects a valid dynamic packed shape."""
+    global _float32_rms_norm_compile_failed
+    if not _float32_rms_norm_compile_failed:
+        try:
+            return _float32_rms_norm_compiled(x, weight, eps)
+        except torch._inductor.exc.InductorError as exc:
+            _float32_rms_norm_compile_failed = True
+            logger.warning(
+                "Inductor failed to compile fp32 RMSNorm for a dynamic shape; "
+                "using the equivalent eager implementation for this process: %s",
+                exc,
+            )
+    return _float32_rms_norm_eager(x, weight, eps)
 
 
 class Float32RMSNorm(nn.Module):

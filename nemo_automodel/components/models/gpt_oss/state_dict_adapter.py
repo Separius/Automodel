@@ -261,7 +261,27 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
         if quantization:
             if hf_fqn.endswith("gate_up_proj") or hf_fqn.endswith("down_proj"):
                 layer_name, projection_type = hf_fqn.rsplit(".", 1)
-                n_experts, _, dim = tensor.shape
+                n_experts, input_dim, output_dim = tensor.shape
+                # MXFP4 stores 32 logical input channels in 16 packed bytes.
+                # GPT-OSS's original hidden/intermediate width is 2880, hence
+                # the historical constant 90.  Derive it from the actual
+                # tensor so physically pruned hidden and expert widths produce
+                # load plans matching their checkpoint geometry.
+                logical_block_size = 32
+                packed_block_bytes = 16
+                if input_dim % logical_block_size:
+                    raise ValueError(
+                        f"MXFP4 expert input width {input_dim} is not divisible by "
+                        f"{logical_block_size} for {hf_fqn}"
+                    )
+                input_groups = input_dim // logical_block_size
+                packed_shape = (
+                    n_experts,
+                    output_dim,
+                    input_groups,
+                    packed_block_bytes,
+                )
+                scale_shape = (n_experts, output_dim, input_groups)
 
                 if isinstance(tensor, torch.distributed.tensor.DTensor):
                     device_mesh = tensor.device_mesh
@@ -279,20 +299,20 @@ class GPTOSSStateDictAdapter(StateDictAdapter):
                         else:
                             safe_placements.append(p)
                     blocks_tensors = torch.distributed.tensor.ones(
-                        (n_experts, dim, 90, 16),
+                        packed_shape,
                         placements=tuple(safe_placements),
                         device_mesh=device_mesh,
                         dtype=torch.uint8,
                     )
                     scales_tensors = torch.distributed.tensor.ones(
-                        (n_experts, dim, 90),
+                        scale_shape,
                         placements=tuple(safe_placements),
                         device_mesh=device_mesh,
                         dtype=torch.uint8,
                     )
                 else:
-                    blocks_tensors = torch.ones((n_experts, dim, 90, 16), dtype=torch.uint8)
-                    scales_tensors = torch.ones((n_experts, dim, 90), dtype=torch.uint8)
+                    blocks_tensors = torch.ones(packed_shape, dtype=torch.uint8)
+                    scales_tensors = torch.ones(scale_shape, dtype=torch.uint8)
 
                 return [
                     (f"{layer_name}.{projection_type}_blocks", blocks_tensors),

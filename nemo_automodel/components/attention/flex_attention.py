@@ -25,7 +25,7 @@ from torch.nn.attention.flex_attention import (
 # FlexAttention mask type. For each mask type, we initialize it at most once per
 # batch. To record what it is initialized, FLEX_ATTN_MASK_T is used as the key to
 # track the initialized mask.
-FLEX_ATTN_MASK_T = tuple[str, int | None] | tuple[int, int, int]
+FLEX_ATTN_MASK_T = tuple[Any, ...]
 
 
 # Adapted from https://github.com/pytorch/torchtitan/pull/1559
@@ -59,6 +59,18 @@ class FlexAttention(torch.nn.Module):
     # block masks for different layers.
     block_masks: ClassVar[dict[FLEX_ATTN_MASK_T, BlockMask]] = {}
 
+    @staticmethod
+    def _normalize_cu_seqlens(cu_seqlens: torch.Tensor) -> torch.Tensor:
+        """Remove the canonical batch-one envelope around packed boundaries."""
+        if cu_seqlens.ndim == 2 and cu_seqlens.shape[0] == 1:
+            cu_seqlens = cu_seqlens.squeeze(0)
+        if cu_seqlens.ndim != 1:
+            raise ValueError(
+                "FlexAttention cu_seqlens must be 1D or a batch-one 2D envelope; "
+                f"got shape={tuple(cu_seqlens.shape)}"
+            )
+        return cu_seqlens
+
     def forward(
         self,
         q: torch.Tensor,
@@ -68,6 +80,8 @@ class FlexAttention(torch.nn.Module):
         sink_weights: torch.Tensor | None = None,
         sliding_window: int = 0,
         enable_gqa: bool = False,
+        qkv_format: str = "bshd",
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if sink_weights is None:
             block_mask = FlexAttention.block_masks[self.mask_key]
@@ -80,9 +94,27 @@ class FlexAttention(torch.nn.Module):
         _, H_kv, S_kv, _ = k.shape
 
         # regular (no-sink) mask + no extra KV col
-        mask_key = (sliding_window, S_q, S_kv)
+        if qkv_format == "thd":
+            if B != 1 or cu_seqlens is None:
+                raise ValueError(
+                    "FlexAttention packed THD requires a batch-one envelope and cu_seqlens; "
+                    f"got batch={B}, cu_seqlens={cu_seqlens is not None}"
+                )
+            cu_seqlens = self._normalize_cu_seqlens(cu_seqlens)
+            boundaries = tuple(int(value) for value in cu_seqlens.detach().cpu().tolist())
+            if not boundaries or boundaries[0] != 0 or boundaries[-1] != S_q or S_q != S_kv:
+                raise ValueError(
+                    "Packed FlexAttention cu_seqlens must span the complete self-attention sequence; "
+                    f"boundaries={boundaries}, query={S_q}, key={S_kv}"
+                )
+            mask_key = ("packed", sliding_window, B, H_q, S_q, S_kv, boundaries, str(q.device))
+        else:
+            mask_key = ("causal", sliding_window, B, H_q, S_q, S_kv, str(q.device))
         if mask_key not in FlexAttention.block_masks:
-            if sliding_window is not None and sliding_window > 0:
+            if qkv_format == "thd":
+                assert cu_seqlens is not None
+                mask_mod = FlexAttention._get_packed_causal_mask_mod(cu_seqlens, sliding_window)
+            elif sliding_window is not None and sliding_window > 0:
                 mask_mod = FlexAttention._get_sliding_window_mask_mod(sliding_window)
             else:
                 mask_mod = FlexAttention._get_causal_mask_mod()
@@ -100,6 +132,19 @@ class FlexAttention(torch.nn.Module):
         block_mask = FlexAttention.block_masks[mask_key]
 
         # run fast flex_attn and return LSE
+        if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+            def _shape_details(tensor: torch.Tensor) -> str:
+                local = tensor.to_local() if hasattr(tensor, "to_local") else tensor
+                return (
+                    f"type={type(tensor).__name__}, shape={tuple(tensor.shape)}, "
+                    f"local_shape={tuple(local.shape)}"
+                )
+
+            raise RuntimeError(
+                "FlexAttention preprocessing must produce 4D BHSD tensors; "
+                f"format={qkv_format}, q=({_shape_details(q)}), "
+                f"k=({_shape_details(k)}), v=({_shape_details(v)})"
+            )
         out, lse = FlexAttention.flex_attn(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa, return_lse=True)
 
         # rescale by sigma(lse - w[h]) and broadcast over D
@@ -132,6 +177,31 @@ class FlexAttention(torch.nn.Module):
             return q_idx >= kv_idx
 
         return causal_mask
+
+    @staticmethod
+    def _get_packed_causal_mask_mod(
+        cu_seqlens: torch.Tensor,
+        sliding_window: int = 0,
+    ) -> _mask_mod_signature:
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        segment_ids = torch.repeat_interleave(
+            torch.arange(lengths.numel(), device=cu_seqlens.device, dtype=torch.long),
+            lengths.to(torch.long),
+        )
+
+        def packed_causal_mask(
+            b: torch.Tensor,
+            h: torch.Tensor,
+            q_idx: torch.Tensor,
+            kv_idx: torch.Tensor,
+        ) -> torch.Tensor:
+            del b, h
+            keep = (segment_ids[q_idx] == segment_ids[kv_idx]) & (kv_idx <= q_idx)
+            if sliding_window is not None and sliding_window > 0:
+                keep = keep & (q_idx - kv_idx < sliding_window)
+            return keep
+
+        return packed_causal_mask
 
     @staticmethod
     def _get_block_causal_mask_mod(batch: torch.Tensor, eos_id: int) -> _mask_mod_signature:

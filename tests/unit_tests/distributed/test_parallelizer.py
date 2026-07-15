@@ -32,6 +32,7 @@ import nemo_automodel.components.distributed.parallelizer as parallelizer
 from nemo_automodel.components.distributed.optimized_tp_plans import _get_class_qualname
 from nemo_automodel.components.distributed.parallelizer import (
     _attention_is_head_sharded,
+    _configure_attention_backends_for_cp,
     _extract_model_layers,
     _get_parallel_plan,
     _update_attention_head_counts_for_tp,
@@ -1239,6 +1240,47 @@ class TestUpdateAttentionHeadCountsForTP:
         model = nn.Module()
         model.config = SimpleNamespace(num_attention_heads=8, hidden_size=64)
         _update_attention_head_counts_for_tp(model, tp_size=2)
+
+    def test_updates_attention_backend_partition_metadata(self):
+        model = self._make_model(num_heads=8, num_kv_heads=2, hidden_size=1024)
+        backend = nn.Module()
+        backend.num_gqa_groups = 2
+        backend.num_gqa_groups_per_partition = 2
+        backend.tp_size = 1
+        backend.tp_group = None
+        model.model.layers[0].self_attn.attn_module = backend
+
+        tp_group = object()
+        _update_attention_head_counts_for_tp(model, tp_size=2, tp_group=tp_group)
+
+        assert backend.tp_size == 2
+        assert backend.tp_group is tp_group
+        assert backend.num_gqa_groups_per_partition == 1
+
+
+def test_configure_attention_backends_for_cp_uses_mesh_group_and_ranks(monkeypatch):
+    model = nn.Module()
+    attention = nn.Module()
+    attention.attn_module = nn.Module()
+    attention.attn_module.set_context_parallel_group = MagicMock()
+    model.attention = attention
+
+    group = object()
+    mesh = MagicMock()
+    mesh.size.return_value = 2
+    mesh.get_group.return_value = group
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda value: [2, 3])
+    stream = object()
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: stream)
+
+    _configure_attention_backends_for_cp(model, mesh)
+
+    attention.attn_module.set_context_parallel_group.assert_called_once_with(
+        group,
+        [2, 3],
+        stream,
+        cp_comm_type="p2p",
+    )
 
 
 class TestAttentionIsHeadSharded:

@@ -387,6 +387,40 @@ class TestPreprocessArgsAndKwargsForAttn:
         assert k_out.shape == expected_shape
         assert v_out.shape == expected_shape
 
+    def test_flex_preprocessing_preserves_packed_thd_layout(self):
+        """Packed THD is wrapped as batch-one BHSD and retains its segment boundaries."""
+        q = torch.randn(13, 8, 64)
+        k = torch.randn(13, 2, 64)
+        v = torch.randn(13, 2, 64)
+        cu_seqlens = torch.tensor([0, 5, 13], dtype=torch.int32)
+
+        q_out, k_out, v_out, attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            q,
+            k,
+            v,
+            attention_mask=None,
+            attn_impl="flex",
+            cu_seqlens=cu_seqlens,
+        )
+
+        assert q_out.shape == (1, 8, 13, 64)
+        assert k_out.shape == (1, 2, 13, 64)
+        assert v_out.shape == (1, 2, 13, 64)
+        assert attn_kwargs["qkv_format"] == "thd"
+        assert torch.equal(attn_kwargs["cu_seqlens"], cu_seqlens)
+
+    def test_flex_preprocessing_synthesizes_single_thd_segment(self):
+        q = torch.randn(13, 8, 64)
+        k = torch.randn(13, 2, 64)
+        v = torch.randn(13, 2, 64)
+
+        _, _, _, attn_kwargs = preprocess_args_and_kwargs_for_attn(
+            q, k, v, attention_mask=None, attn_impl="flex"
+        )
+
+        assert attn_kwargs["qkv_format"] == "thd"
+        assert attn_kwargs["cu_seqlens"].tolist() == [0, 13]
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_te_default_window_size(self):
         """Test TE preprocessing includes default window_size."""
@@ -434,6 +468,14 @@ class TestPostprocessOutputForAttn:
         # Should transpose back to [B, H, S, D]
         expected_shape = (self.batch_size, self.num_heads, self.seq_len, self.head_dim)
         assert x_out.shape == expected_shape
+
+    def test_flex_postprocessing_restores_packed_thd_layout(self):
+        """Batch-one Flex output is restored to token-major THD."""
+        x = torch.randn(1, self.num_heads, self.seq_len, self.head_dim)
+
+        x_out = postprocess_output_for_attn(x, attn_impl="flex", qkv_format="thd")
+
+        assert x_out.shape == (self.seq_len, self.num_heads, self.head_dim)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_te_postprocessing_no_change(self):

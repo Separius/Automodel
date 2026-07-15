@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import contextlib
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
@@ -289,6 +289,7 @@ def make_cp_batch_and_ctx(
     padding_token_id: int = 0,
     num_chunks: int = 1,
     seq_lens_padding_value: int = -1000,
+    auxiliary_sequence_keys: Dict[str, int] | None = None,
 ):
     """
     Build a CP context manager and shards a batch. If the input device_mesh is None or the size
@@ -396,6 +397,26 @@ def make_cp_batch_and_ctx(
         cp_seq_dims.append(1)
         cp_no_restore_buffers.add(loss_mask)
 
+    # Callers that collect token-level diagnostics may need non-model metadata
+    # (for example original packed-sample IDs) to follow the exact same load-
+    # balanced CP permutation as inputs/labels.  Register those tensors with the
+    # CP context, but leave interpretation and removal to the caller.
+    auxiliary_pad_fills = {}
+    for key, fill_value in dict(auxiliary_sequence_keys or {}).items():
+        if key not in batch:
+            raise KeyError(f"auxiliary CP sequence key {key!r} is missing from batch")
+        value = batch[key]
+        if not isinstance(value, torch.Tensor) or value.ndim < 2 or value.shape[1] != seq_len:
+            raise ValueError(
+                f"auxiliary CP sequence key {key!r} must be a tensor with sequence "
+                f"dimension 1 of length {seq_len}"
+            )
+        batch_buffer_keys[len(cp_buffers)] = key
+        cp_buffers.append(value)
+        cp_seq_dims.append(1)
+        cp_no_restore_buffers.add(value)
+        auxiliary_pad_fills[key] = fill_value
+
     # Add padding_mask if available in batch
     if "padding_mask" in batch:
         padding_mask = batch["padding_mask"]
@@ -421,6 +442,7 @@ def make_cp_batch_and_ctx(
         "attention_mask": False,  # HF: 0 == "this position is pad, ignore"
         # everything else (input_ids, position_ids, ...) -> 0
     }
+    PAD_FILL.update(auxiliary_pad_fills)
     cp_divisor = cp_mesh.size() * 2
     if seq_len % cp_divisor != 0:
         pad_len = cp_divisor - (seq_len % cp_divisor)
@@ -442,6 +464,41 @@ def make_cp_batch_and_ctx(
         # downstream consumer reading from the dict sees the padded shape.
         for idx, key in batch_buffer_keys.items():
             batch[key] = cp_buffers[idx]
+
+    # ``torch.distributed.tensor.experimental.context_parallel`` shards its
+    # registered buffers with an in-place ``resize_``.  That is valid for token
+    # IDs and labels, but VLM CP pre-embedding produces an autograd tensor and
+    # PyTorch forbids resizing variables that require gradients.  Use the same
+    # load-balanced sharding primitive directly for the differentiable primary
+    # tensor, then let the context manage the remaining non-differentiable
+    # buffers and attention dispatcher as usual.
+    primary_buffer = cp_buffers[0]
+    if primary_buffer.requires_grad:
+        from torch.distributed.tensor.experimental._context_parallel._attention import (
+            _create_default_load_balancer,
+        )
+
+        load_balancer = _create_default_load_balancer(
+            primary_buffer.shape[cp_seq_dims[0]], cp_mesh.size(), primary_buffer.device
+        )
+        load_balance_indices = load_balancer._generate_indices()
+        indices = load_balance_indices
+        if indices.shape[0] == 1 and primary_buffer.shape[0] > 1:
+            indices = indices.expand(primary_buffer.shape[0], -1)
+        for _ in range(cp_seq_dims[0] + 1, primary_buffer.ndim):
+            indices = indices.unsqueeze(-1)
+        indices = indices.expand(primary_buffer.shape)
+        balanced_primary = torch.gather(primary_buffer, cp_seq_dims[0], indices)
+        local_seq_len = balanced_primary.shape[cp_seq_dims[0]] // cp_mesh.size()
+        sharded_primary = balanced_primary.narrow(
+            cp_seq_dims[0], cp_mesh.get_local_rank() * local_seq_len, local_seq_len
+        ).contiguous()
+        if not sharded_primary.requires_grad or sharded_primary.grad_fn is None:
+            raise RuntimeError("Autograd-safe CP sharding detached the VLM input embeddings")
+        batch[primary_key] = sharded_primary
+        cp_buffers = cp_buffers[1:]
+        cp_seq_dims = cp_seq_dims[1:]
+        cp_no_restore_buffers.discard(primary_buffer)
 
     cp_ctx = create_context_parallel_ctx(
         cp_mesh=cp_mesh,

@@ -507,7 +507,7 @@ class MiniMaxM3Attention(nn.Module):
             q, k, v, attention_mask, self.backend.attn, **attn_kwargs
         )
         out = self.attn_func(q, k, v, **_attn_kwargs)
-        out = postprocess_output_for_attn(out, self.backend.attn)
+        out = postprocess_output_for_attn(out, self.backend.attn, qkv_format=qkv_format)
 
         flatten_dim = 2 if qkv_format == "bshd" else 1
         return self.o_proj(out.flatten(flatten_dim))

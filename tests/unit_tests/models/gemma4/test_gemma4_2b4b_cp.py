@@ -126,6 +126,19 @@ def test_get_capabilities_dense_audio_variant_enables_cp():
     assert caps.supports_ep is False
 
 
+def test_get_capabilities_unified_without_ple_keeps_tp_and_pp():
+    cfg = _cfg(audio=True)
+    cfg.text_config.hidden_size_per_layer_input = 0
+    cfg.text_config.num_kv_shared_layers = 0
+
+    caps = Gemma4ForConditionalGeneration.get_capabilities(cfg)
+
+    assert caps.supports_tp is True
+    assert caps.supports_cp is True
+    assert caps.supports_pp is True
+    assert caps.supports_ep is False
+
+
 def test_get_capabilities_plain_dense_unchanged():
     # No audio_config -> plain dense 31B path keeps full TP/CP/PP.
     caps = Gemma4ForConditionalGeneration.get_capabilities(_cfg(audio=False))

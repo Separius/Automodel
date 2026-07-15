@@ -142,7 +142,10 @@ class GptOssAttention(nn.Module):
                 "sink_weights": (self.sinks.to_local() if isinstance(self.sinks, DTensor) else self.sinks),
                 "sliding_window": (self.sliding_window if self.sliding_window is not None else 0),
                 "enable_gqa": True,
+                "qkv_format": qkv_format,
             }
+            if torch.is_tensor(attn_kwargs.get("cu_seqlens")):
+                updated_attn_kwargs["cu_seqlens"] = attn_kwargs["cu_seqlens"]
         else:
             updated_attn_kwargs = attn_kwargs
             if self.sliding_window is not None:
@@ -152,7 +155,7 @@ class GptOssAttention(nn.Module):
             q, k, v, attention_mask, self.backend.attn, **updated_attn_kwargs
         )
         output = self.attn_func(q, k, v, **_attn_kwargs)
-        output = postprocess_output_for_attn(output, self.backend.attn)
+        output = postprocess_output_for_attn(output, self.backend.attn, qkv_format=qkv_format)
 
         # Reshape and project output
         flatten_dim = 2 if qkv_format == "bshd" else 1

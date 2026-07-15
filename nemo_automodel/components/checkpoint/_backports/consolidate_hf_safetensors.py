@@ -67,6 +67,24 @@ _QUANTIZED_DTYPE_WARNING_LIMIT = 5
 _MISSING_FQN_WARNING_LIMIT = 5
 
 
+def _merge_rank_fqn_mappings(
+    mappings: list[dict[str, Any] | None],
+    *,
+    mapping_name: str,
+) -> dict[str, Any]:
+    """Union PP-local checkpoint metadata and reject ambiguous shared entries."""
+    merged: dict[str, Any] = {}
+    for rank, mapping in enumerate(mappings):
+        for fqn, value in (mapping or {}).items():
+            if fqn in merged and merged[fqn] != value:
+                raise ValueError(
+                    f"conflicting {mapping_name} mapping for {fqn!r}: "
+                    f"{merged[fqn]!r} vs {value!r} on rank {rank}"
+                )
+            merged[fqn] = value
+    return merged
+
+
 def resolve_dtype_cast(dtype_name: str | None) -> torch.dtype | None:
     """Resolve an optional dtype cast name into a torch dtype."""
     if dtype_name is None:
@@ -785,6 +803,82 @@ def _write_overall_metadata_file_from_shards(
         json.dump(metadata_to_write, metadata_file, indent=2)
 
 
+def _complete_fqn_to_index_mapping(
+    input_dir: str,
+    fqn_to_index_mapping: dict[str, int],
+) -> dict[str, int]:
+    """Assign adapter-materialized tensors missing from a source HF shard map.
+
+    State-dict adapters may replace several source tensors with one materialized
+    output tensor (for example quantized blocks/scales with a dense weight).
+    Prefer the shard of the closest source-name sibling and fall back to the
+    least-populated existing shard.  The result is deterministic on every rank.
+    """
+    completed = dict(fqn_to_index_mapping)
+    input_fqns: set[str] = set()
+    for input_file in sorted(glob.glob(os.path.join(input_dir, f"*{SUFFIX}"))):
+        with open(input_file, "rb") as f:
+            metadata, _ = _get_safetensors_file_metadata(f)
+        input_fqns.update(
+            key for key in metadata if key != DEFAULT_EXTRA_METADATA_KEY
+        )
+
+    missing = sorted(input_fqns.difference(completed))
+    if not missing:
+        return completed
+
+    shard_counts: dict[int, int] = {}
+    for index in completed.values():
+        shard_counts[index] = shard_counts.get(index, 0) + 1
+    if not shard_counts:
+        shard_counts[1] = 0
+
+    source_items = tuple(sorted(completed.items()))
+    for fqn in missing:
+        components = fqn.split(".")
+        best_score = (-1, -1)
+        candidate_indices: list[int] = []
+        for source_fqn, index in source_items:
+            source_components = source_fqn.split(".")
+            matched = 0
+            for left, right in zip(components, source_components):
+                if left != right:
+                    break
+                matched += 1
+            next_left = components[matched] if matched < len(components) else ""
+            next_right = (
+                source_components[matched] if matched < len(source_components) else ""
+            )
+            lexical = len(os.path.commonprefix((next_left, next_right)))
+            score = (matched, lexical)
+            if score > best_score:
+                best_score = score
+                candidate_indices = [index]
+            elif score == best_score:
+                candidate_indices.append(index)
+
+        if best_score[0] > 0:
+            index = min(
+                set(candidate_indices),
+                key=lambda candidate: (
+                    -candidate_indices.count(candidate),
+                    shard_counts.get(candidate, 0),
+                    candidate,
+                ),
+            )
+        else:
+            index = min(shard_counts, key=lambda candidate: (shard_counts[candidate], candidate))
+        completed[fqn] = index
+        shard_counts[index] = shard_counts.get(index, 0) + 1
+
+    logger.warning(
+        "Assigned %d adapter-materialized tensor(s) absent from the source HF shard map; examples: %s",
+        len(missing),
+        {fqn: completed[fqn] for fqn in missing[:_MISSING_FQN_WARNING_LIMIT]},
+    )
+    return completed
+
+
 def _consolidate_safetensors_files(
     input_dir: str,
     output_dir: str,
@@ -905,6 +999,9 @@ def consolidate_safetensors_files(
             cast_dtype,
         )
 
+    fqn_to_index_mapping = _complete_fqn_to_index_mapping(
+        input_dir, fqn_to_index_mapping
+    )
     max_index = max(fqn_to_index_mapping.values())
     fqn_to_file_mapping = {fqn: _gen_file_name(idx, max_index) for fqn, idx in fqn_to_index_mapping.items()}
 
@@ -970,6 +1067,22 @@ def consolidate_safetensors_files_on_every_rank(
         rank = 0
         world_size = 1
         logger.warning("Distributed environment not initialized. Running in single process mode.")
+    if dist.is_available() and dist.is_initialized():
+        local_metadata = {
+            "index": dict(fqn_to_index_mapping),
+            "dtype": dict(fqn_to_dtype_mapping or {}),
+        }
+        rank_metadata: list[dict[str, dict[str, Any]] | None] = [None] * world_size
+        dist.all_gather_object(rank_metadata, local_metadata, group=process_group)
+        fqn_to_index_mapping = _merge_rank_fqn_mappings(
+            [metadata["index"] if metadata is not None else None for metadata in rank_metadata],
+            mapping_name="checkpoint shard",
+        )
+        merged_dtype_mapping = _merge_rank_fqn_mappings(
+            [metadata["dtype"] if metadata is not None else None for metadata in rank_metadata],
+            mapping_name="checkpoint dtype",
+        )
+        fqn_to_dtype_mapping = merged_dtype_mapping or None
     if rank == 0:
         logger.info("Consolidating safetensors files from %s to %s.", input_dir, output_dir)
         if cast_dtype is not None:
@@ -979,6 +1092,10 @@ def consolidate_safetensors_files_on_every_rank(
                 "are unchanged.",
                 cast_dtype,
             )
+
+    fqn_to_index_mapping = _complete_fqn_to_index_mapping(
+        input_dir, fqn_to_index_mapping
+    )
 
     # Find all unique indices in the mapping
     unique_indices = set(fqn_to_index_mapping.values())

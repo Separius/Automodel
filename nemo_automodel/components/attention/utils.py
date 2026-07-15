@@ -189,10 +189,24 @@ def preprocess_args_and_kwargs_for_attn(
 
     elif attn_impl == "flex":
         attn_kwargs = kwargs
-        # Transpose for SDPA
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
+        if q.ndim == 3:
+            # Packed THD [T, H, D] has no batch axis, while torch FlexAttention
+            # requires BHSD. Preserve the packed boundaries for the Flex mask and
+            # use a batch-one envelope; postprocessing removes that envelope.
+            q = q.transpose(0, 1).unsqueeze(0).contiguous()
+            k = k.transpose(0, 1).unsqueeze(0).contiguous()
+            v = v.transpose(0, 1).unsqueeze(0).contiguous()
+            attn_kwargs["qkv_format"] = "thd"
+            if not torch.is_tensor(attn_kwargs.get("cu_seqlens")):
+                attn_kwargs["cu_seqlens"] = torch.tensor(
+                    [0, q.shape[2]],
+                    dtype=torch.int32,
+                    device=q.device,
+                )
+        else:
+            q = q.transpose(1, 2).contiguous()
+            k = k.transpose(1, 2).contiguous()
+            v = v.transpose(1, 2).contiguous()
     elif attn_impl == "magi":  # pragma: no cover - requires magi_attention
         # magi's attn_func consumes the native [b, s, nh, hd] / [t, nh, hd] layout
         # directly (no transpose). Forward the genuine mask metadata so the FFA key
@@ -257,8 +271,20 @@ def preprocess_args_and_kwargs_for_attn(
     return q, k, v, attn_kwargs
 
 
-def postprocess_output_for_attn(x: torch.Tensor, attn_impl: str) -> torch.Tensor:
+def postprocess_output_for_attn(
+    x: torch.Tensor,
+    attn_impl: str,
+    qkv_format: str = "bshd",
+) -> torch.Tensor:
     """Postprocess attention output based on attn_impl requirements."""
     if attn_impl in ("sdpa", "flex"):
-        x = x.transpose(1, 2).contiguous()
+        if qkv_format == "thd":
+            if x.ndim != 4 or x.shape[0] != 1:
+                raise ValueError(
+                    "Packed THD attention output must use a batch-one BHSD envelope; "
+                    f"got shape={tuple(x.shape)}"
+                )
+            x = x.squeeze(0).transpose(0, 1).contiguous()
+        else:
+            x = x.transpose(1, 2).contiguous()
     return x

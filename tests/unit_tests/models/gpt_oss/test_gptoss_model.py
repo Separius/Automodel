@@ -597,8 +597,9 @@ class TestGptOssAttentionTHD:
 
         with patch.object(attn, "attn_func") as mock_attn:
             mock_attn.return_value = torch.randn(
-                total_tokens,
+                1,
                 gpt_config.num_attention_heads,
+                total_tokens,
                 gpt_config.head_dim,
                 dtype=torch.bfloat16,
                 device=device,
@@ -607,6 +608,8 @@ class TestGptOssAttentionTHD:
 
             # Forward should succeed and attn_func should be called
             mock_attn.assert_called_once()
+            assert mock_attn.call_args.kwargs["qkv_format"] == "thd"
+            assert torch.equal(mock_attn.call_args.kwargs["cu_seqlens"], cu_seqlens)
             # Output should be 2D [T, hidden] (THD flattened)
             assert output.ndim == 2
             assert output.shape[0] == total_tokens
@@ -624,8 +627,9 @@ class TestGptOssAttentionTHD:
 
         with patch.object(attn, "attn_func") as mock_attn:
             mock_attn.return_value = torch.randn(
-                total_tokens,
+                1,
                 gpt_config.num_attention_heads,
+                total_tokens,
                 gpt_config.head_dim,
                 dtype=torch.bfloat16,
                 device=device,

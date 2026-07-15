@@ -44,6 +44,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForS
 
 from nemo_automodel.components.models.baichuan.model import BaichuanForCausalLM
 from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
+from nemo_automodel.components.models.glm4_moe_lite.model import Glm4MoeLiteForCausalLM
 from nemo_automodel.components.models.llama.model import LlamaForCausalLM as CustomLlamaForCausalLM
 from nemo_automodel.components.models.mistral3.model import Ministral3ForCausalLM
 from nemo_automodel.components.models.mistral3_vlm.model import Mistral3FP8VLMForConditionalGeneration
@@ -670,11 +671,20 @@ def _parallelize_qwen3_5_vlm(
 
     Qwen3.5 has mixed attention: full self_attn (every 4th layer) + linear_attn
     (GatedDeltaNet). The transformers-provided base_model_tp_plan covers only
-    self_attn + MLP — linear_attn is not TP-shardable with stock kernels.
+    self_attn + MLP — linear_attn is not TP-shardable with stock kernels. The
+    top-level LM head is not part of that inner-language-model plan, so add it
+    explicitly and keep vocabulary logits sharded. Distribution-aware losses
+    can then reduce over the TP group without gathering the long-context logits.
     """
     from nemo_automodel.components.distributed.parallelizer import get_hf_tp_shard_plan
 
-    return get_hf_tp_shard_plan(model)
+    plan = get_hf_tp_shard_plan(model)
+    if getattr(model, "lm_head", None) is not None:
+        plan["lm_head"] = ColwiseParallel(
+            output_layouts=Shard(-1),
+            use_local_output=False,
+        )
+    return plan
 
 
 def _parallelize_falcon_h1(
@@ -718,6 +728,44 @@ def _parallelize_falcon_h1(
     )
 
 
+def _parallelize_glm4_moe_lite(
+    model,
+    sequence_parallel: bool = False,
+) -> Dict[str, ParallelStyle]:
+    """Head-parallel native GLM-4-MoE-Lite without duplicating EP experts.
+
+    The HF plan uses a specialized ``mla_kv_a_proj`` style for the compressed
+    KV projection.  Native AutoModel can keep that comparatively small
+    projection replicated: only the decoded per-head Q/KV projections need to
+    be column-sharded, paired with a row-sharded output projection.  Routed
+    experts are intentionally absent because EP owns their distribution.
+    """
+
+    if sequence_parallel:
+        import warnings
+
+        warnings.warn(
+            "sequence_parallel=True is not supported for native GLM MLA and will be ignored",
+            stacklevel=2,
+        )
+    return cast(
+        Dict[str, ParallelStyle],
+        {
+            "model.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+            "model.layers.*.self_attn.q_b_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.kv_b_proj": ColwiseParallel(),
+            "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+            "model.layers.*.mlp.up_proj": ColwiseParallel(),
+            "model.layers.*.mlp.down_proj": RowwiseParallel(),
+            "lm_head": ColwiseParallel(
+                output_layouts=Shard(-1),
+                use_local_output=False,
+            ),
+        },
+    )
+
+
 # Keyed by qualified class name — see _get_class_qualname for why.
 PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     _get_class_qualname(BaichuanForCausalLM): _parallelize_baichuan,
@@ -750,6 +798,7 @@ PARALLELIZE_FUNCTIONS: Dict[str, Callable[..., Dict[str, ParallelStyle]]] = {
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input
     _get_class_qualname(Gemma3ForConditionalGeneration): _parallelize_gemma3,
     _get_class_qualname(Gemma4ForConditionalGeneration): _parallelize_gemma4,
+    _get_class_qualname(Glm4MoeLiteForCausalLM): _parallelize_glm4_moe_lite,
     _get_class_qualname(PhiForCausalLM): _parallelize_phi,
     _get_class_qualname(Phi3ForCausalLM): _parallelize_phi3,
     _get_class_qualname(CustomLlamaForCausalLM): _parallelize_llama,

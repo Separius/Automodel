@@ -239,9 +239,9 @@ class Glm4MoeLiteForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
     class ModelCapabilities:
         """Declared parallelism capabilities for this model class."""
 
-        supports_tp: bool = False
-        supports_cp: bool = False
-        supports_pp: bool = False
+        supports_tp: bool = True
+        supports_cp: bool = True
+        supports_pp: bool = True
         supports_ep: bool = True
 
     @classmethod

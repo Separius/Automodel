@@ -23,6 +23,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors import (
+    _merge_rank_fqn_mappings,
     _write_sub_tensor_to_file_optimized,
     consolidate_safetensors_files,
     resolve_dtype_cast,
@@ -33,6 +34,30 @@ from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _maybe_rename_index_for_diffusers,
 )
 from nemo_automodel.components.checkpoint._backports.hf_utils import CUSTOM_METADATA_KEY
+
+
+def test_merge_rank_fqn_mappings_unions_pp_local_metadata():
+    merged = _merge_rank_fqn_mappings(
+        [
+            {"model.layers.0.weight": 1, "model.norm.weight": 3},
+            {"model.layers.12.weight": 2, "model.norm.weight": 3},
+        ],
+        mapping_name="checkpoint shard",
+    )
+
+    assert merged == {
+        "model.layers.0.weight": 1,
+        "model.layers.12.weight": 2,
+        "model.norm.weight": 3,
+    }
+
+
+def test_merge_rank_fqn_mappings_rejects_conflicting_shared_fqn():
+    with pytest.raises(ValueError, match="conflicting checkpoint shard mapping"):
+        _merge_rank_fqn_mappings(
+            [{"model.norm.weight": 1}, {"model.norm.weight": 2}],
+            mapping_name="checkpoint shard",
+        )
 
 
 @pytest.mark.run_only_on("CPU")
@@ -195,6 +220,49 @@ def test_consolidate_preserves_semantics_for_multi_shard_outputs_without_append(
         "model-00001-of-00002.safetensors": ["wb"],
         "model-00002-of-00002.safetensors": ["wb"],
     }
+
+
+@pytest.mark.run_only_on("CPU")
+def test_consolidate_assigns_adapter_materialized_tensors_to_nearest_source_shard(tmp_path):
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    input_dir.mkdir()
+    output_dir.mkdir()
+    tensors = {
+        "model.layers.0.mlp.experts.down_proj": torch.arange(8, dtype=torch.float32),
+        "model.layers.0.mlp.experts.down_proj_bias": torch.arange(2, dtype=torch.float32),
+        "model.layers.1.norm.weight": torch.arange(2, dtype=torch.float32),
+    }
+    save_file(
+        tensors,
+        input_dir / "model-00001-of-00001.safetensors",
+        metadata={
+            CUSTOM_METADATA_KEY: json.dumps(
+                {
+                    name: {"saved_offsets": [0 for _ in tensor.shape]}
+                    for name, tensor in tensors.items()
+                }
+            )
+        },
+    )
+
+    consolidate_safetensors_files(
+        input_dir=str(input_dir),
+        output_dir=str(output_dir),
+        fqn_to_index_mapping={
+            "model.layers.0.mlp.experts.down_proj_bias": 1,
+            "model.layers.1.norm.weight": 2,
+        },
+    )
+
+    with open(output_dir / "model.safetensors.index.json") as f:
+        index = json.load(f)
+    assert index["weight_map"]["model.layers.0.mlp.experts.down_proj"] == (
+        "model-00001-of-00002.safetensors"
+    )
+    assert "model.layers.0.mlp.experts.down_proj" in load_file(
+        output_dir / "model-00001-of-00002.safetensors"
+    )
 
 
 @pytest.mark.run_only_on("CPU")

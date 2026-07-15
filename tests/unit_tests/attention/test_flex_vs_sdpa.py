@@ -19,6 +19,41 @@ import pytest
 from nemo_automodel.components.attention.flex_attention import FlexAttention
 
 
+def test_flex_attention_normalizes_batch_one_cu_seqlens_envelope():
+    cu_seqlens = torch.tensor([[0, 3, 7]], dtype=torch.int32)
+
+    actual = FlexAttention._normalize_cu_seqlens(cu_seqlens)
+
+    assert actual.shape == (3,)
+    assert actual.tolist() == [0, 3, 7]
+
+
+def test_packed_causal_mask_respects_segments_and_sliding_window():
+    cu_seqlens = torch.tensor([0, 3, 7], dtype=torch.int32)
+    mask_mod = FlexAttention._get_packed_causal_mask_mod(cu_seqlens, sliding_window=2)
+
+    actual = torch.empty((7, 7), dtype=torch.bool)
+    for query in range(7):
+        for key in range(7):
+            actual[query, key] = mask_mod(
+                torch.tensor(0), torch.tensor(0), torch.tensor(query), torch.tensor(key)
+            )
+
+    expected = torch.tensor(
+        [
+            [1, 0, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0, 0],
+            [0, 1, 1, 0, 0, 0, 0],
+            [0, 0, 0, 1, 0, 0, 0],
+            [0, 0, 0, 1, 1, 0, 0],
+            [0, 0, 0, 0, 1, 1, 0],
+            [0, 0, 0, 0, 0, 1, 1],
+        ],
+        dtype=torch.bool,
+    )
+    assert torch.equal(actual, expected)
+
+
 def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
     # sliding_window == 0 means no sliding window
     n_tokens, n_heads, q_mult, d_head = Q.shape

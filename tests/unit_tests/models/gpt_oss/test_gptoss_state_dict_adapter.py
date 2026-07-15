@@ -263,8 +263,8 @@ class TestGPTOSSStateDictAdapter:
         tensor = torch.randn(2, 64, 128)
         result = adapter.convert_single_tensor_to_hf(fqn, tensor, quantization=True)
         out = dict(result)
-        assert out["model.layers.0.mlp.experts.gate_up_proj_blocks"].shape == (2, 128, 90, 16)
-        assert out["model.layers.0.mlp.experts.gate_up_proj_scales"].shape == (2, 128, 90)
+        assert out["model.layers.0.mlp.experts.gate_up_proj_blocks"].shape == (2, 128, 2, 16)
+        assert out["model.layers.0.mlp.experts.gate_up_proj_scales"].shape == (2, 128, 2)
 
     def test_dequantize_block_scale_tensors_merges_pairs(self):
         config = self.create_mock_config()

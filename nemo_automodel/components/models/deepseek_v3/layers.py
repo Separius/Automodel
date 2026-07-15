@@ -43,6 +43,7 @@ class MLA(nn.Module):
         super().__init__()
 
         self.n_heads = config.num_attention_heads
+        self._global_n_heads = config.num_attention_heads
         self.q_lora_rank = config.q_lora_rank
         self.kv_lora_rank = config.kv_lora_rank
         self.qk_nope_head_dim = config.qk_nope_head_dim
@@ -149,6 +150,31 @@ class MLA(nn.Module):
             else:  # pragma: no cover - torch.compile path exercised on GPU benchmark runs only
                 logger.warning("compile MLA forward: torch.compile(fullgraph=True) the MLA forward (attn=sdpa).")
                 self._compiled_forward = torch.compile(self._forward_impl, fullgraph=True, dynamic=False)
+
+    def set_tensor_parallel_size(self, tp_size: int) -> None:
+        """Update MLA runtime geometry after head-wise TP sharding.
+
+        ``q_b_proj`` and ``kv_b_proj`` are column-sharded and ``o_proj`` is
+        row-sharded, so every rank executes only its local decoded heads.  The
+        compressed Q/KV latent projections stay replicated.  Rebuild TE's
+        parameter-free attention wrapper because it records the head count at
+        construction time; SDPA needs only the reshape count update.
+        """
+
+        tp_size = int(tp_size)
+        if tp_size < 1 or self._global_n_heads % tp_size:
+            raise ValueError(
+                f"MLA heads={self._global_n_heads} must be divisible by TP={tp_size}"
+            )
+        self.n_heads = self._global_n_heads // tp_size
+        if self.backend.attn == "te":
+            self.attn_module, self.attn_func = initialize_attn_module_and_func(
+                attn_impl="te",
+                num_attention_heads=self.n_heads,
+                num_qk_channels=self.qk_head_dim,
+                num_v_channels=self.v_head_dim,
+                softmax_scale=self.softmax_scale,
+            )
 
     def forward(
         self,

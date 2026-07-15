@@ -20,6 +20,7 @@ MoE parallelizer.
 """
 
 from collections.abc import MutableMapping
+import inspect
 from typing import Any, Iterator, Optional, Union
 
 import torch
@@ -446,6 +447,18 @@ def _derive_padding_mask(attention_mask: torch.Tensor) -> torch.Tensor:
     return attention_mask.bool().logical_not()
 
 
+def _call_mask_builder(builder, kwargs: dict[str, Any]):
+    """Call a Transformers mask helper across private-signature revisions."""
+
+    parameters = inspect.signature(builder).parameters
+    values = dict(kwargs)
+    if "input_embeds" in parameters and "inputs_embeds" in values:
+        values["input_embeds"] = values["inputs_embeds"]
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return builder(**values)
+    return builder(**{name: value for name, value in values.items() if name in parameters})
+
+
 def _build_packed_gemma4_causal_mask_mapping(
     packed_seq_ids: torch.Tensor,
     mm_token_type_ids: torch.Tensor,
@@ -693,17 +706,30 @@ class Gemma4MoETextModelBackend(nn.Module):
                 flex_block_size=(32, 32) if getattr(self.config, "head_dim", 0) > 256 else 128,
             )
         elif use_vision_bidirectional_mask:
-            from transformers.models.gemma4.modeling_gemma4 import create_causal_mask_mapping
-
-            causal_mask_mapping = create_causal_mask_mapping(
-                config=self.config,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-                mm_token_type_ids=mm_token_type_ids,
-                pixel_values=pixel_values,
-                is_training=self.training,
+            # Keep this backend independent of Transformers' private mask helper:
+            # its name and signature changed across the Gemma4 releases used by
+            # AutoModel. A single unpacked sample is just one packed segment, so
+            # the same model-owned builder provides identical vision-group edges.
+            single_sequence_ids = torch.ones(
+                inputs_embeds.shape[:2],
+                dtype=torch.long,
+                device=inputs_embeds.device,
+            )
+            if padding_mask is not None:
+                single_sequence_ids = single_sequence_ids.masked_fill(
+                    padding_mask.to(device=inputs_embeds.device, dtype=torch.bool),
+                    0,
+                )
+            causal_mask_mapping = _build_packed_gemma4_causal_mask_mapping(
+                single_sequence_ids,
+                mm_token_type_ids.to(device=inputs_embeds.device),
+                dtype=inputs_embeds.dtype,
+                sliding_window=getattr(self.config, "sliding_window", None),
+                as_block_mask=getattr(self.config, "_attn_implementation", None)
+                == "flex_attention",
+                flex_block_size=(32, 32)
+                if getattr(self.config, "head_dim", 0) > 256
+                else 128,
             )
         else:
             from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -717,8 +743,11 @@ class Gemma4MoETextModelBackend(nn.Module):
                 "position_ids": position_ids,
             }
             causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
+                "full_attention": _call_mask_builder(create_causal_mask, mask_kwargs),
+                "sliding_attention": _call_mask_builder(
+                    create_sliding_window_causal_mask,
+                    mask_kwargs,
+                ),
             }
 
         position_embeddings = {}
@@ -819,15 +848,14 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         if bool(getattr(text_config, "enable_moe_block", False)):
             # MoE variant: gemma-4-26B-A4B-it
             return ModelCapabilities(
-                supports_tp=False,
+                supports_tp=True,
                 supports_cp=True,
-                supports_pp=False,
+                supports_pp=True,
                 supports_ep=True,
             )
         if getattr(config, "audio_config", None) is not None:
-            # Dense + audio variant: gemma-4-E2B-it, gemma-4-E4B-it.
-            # CP supported; TP/PP/EP off. Two features beyond plain-dense 31B were
-            # exercised:
+            # Unified multimodal variants. CP is supported throughout. Two
+            # optional text features need extra TP/PP handling:
             #   * per-layer inputs (``hidden_size_per_layer_input``): under CP,
             #     computed on the full sequence in ``prepare_model_inputs_for_cp``
             #     and sharded contiguously on the seq dim alongside
@@ -842,18 +870,25 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             #     recompute their own K/V -- identical between CP and non-CP, so
             #     parity holds either way (the dead shared-layer K/V projections
             #     are frozen by ``freeze_unused_kv_sharing_params``).
-            # TP is intentionally OFF: HF's ``Gemma4Model.forward`` builds the
+            # TP/PP remain off only when those features are present. HF's
+            # ``Gemma4Model.forward`` builds the
             # per-layer inputs via ``torch.where(multimodal_mask, pad_embedding,
             # inputs_embeds)`` where ``pad_embedding`` is sliced from the (TP-
             # sharded) embedding weight. Under DTensor this raises "mixed
             # torch.Tensor and DTensor" -- an HF-side limitation we cannot fix
-            # without patching frozen transformers source. (Plain-dense 31B has
-            # no ``hidden_size_per_layer_input`` so it skips this branch and TP
-            # works there.)
+            # without a PLE-aware DTensor bridge. Unified checkpoints without
+            # either feature (for example 12B) use the standard TP/PP path.
+            has_ple = bool(getattr(text_config, "hidden_size_per_layer_input", 0))
+            has_kv_sharing = bool(getattr(text_config, "num_kv_shared_layers", 0))
+            has_cross_stage_state = has_ple or has_kv_sharing
             return ModelCapabilities(
-                supports_tp=False,
+                # Unified Gemma checkpoints such as 12B still use the standard
+                # text topology and can use the existing TP/PP plans. E2B/E4B
+                # additionally carry PLE and cross-layer KV state; those need a
+                # dedicated TP layout and PP side-channel before they are safe.
+                supports_tp=not has_cross_stage_state,
                 supports_cp=True,
-                supports_pp=False,
+                supports_pp=not has_cross_stage_state,
                 supports_ep=False,
             )
         # Plain dense variant: gemma-4-31B-it

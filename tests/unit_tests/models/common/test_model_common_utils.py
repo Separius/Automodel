@@ -20,6 +20,8 @@ import pytest
 import torch
 from torch import nn
 
+import nemo_automodel.components.models.common.utils as common_utils
+
 from nemo_automodel.components.models.common.utils import (
     BackendConfig,
     TEFp8Config,
@@ -30,6 +32,28 @@ from nemo_automodel.components.models.common.utils import (
     set_is_first_microbatch,
     set_is_optim_step,
 )
+
+
+def test_float32_rms_norm_falls_back_after_inductor_failure(monkeypatch):
+    calls = []
+
+    def broken_compiled(*args, **kwargs):
+        calls.append(1)
+        raise torch._inductor.exc.InductorError(AssertionError("symbolic shape"), None)
+
+    monkeypatch.setattr(common_utils, "_float32_rms_norm_compiled", broken_compiled)
+    monkeypatch.setattr(common_utils, "_float32_rms_norm_compile_failed", False)
+    module = common_utils.Float32RMSNorm(4, dtype=torch.float32)
+    x = torch.randn(2, 3, 4)
+
+    first = module(x)
+    second = module(x)
+    expected = common_utils._float32_rms_norm_eager(x, module.weight, module.eps)
+
+    torch.testing.assert_close(first, expected)
+    torch.testing.assert_close(second, expected)
+    assert calls == [1]
+    assert common_utils._float32_rms_norm_compile_failed is True
 
 
 class TestIsOptimStep:

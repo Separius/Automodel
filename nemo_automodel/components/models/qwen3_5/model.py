@@ -872,6 +872,59 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = Qwen3_5DenseStateDictAdapter(route_linear_attn_fp32_params=True)
 
+    def customize_pipeline_stage_modules(
+        self,
+        module_names_per_stage: list[list[str]],
+        *,
+        layers_prefix: str,
+        text_model: nn.Module | None = None,
+    ) -> list[list[str]]:
+        """Keep the MTP head on the final virtual pipeline stage."""
+        del layers_prefix, text_model
+        stage_modules = [list(modules) for modules in module_names_per_stage]
+        if self.mtp is not None and stage_modules and "mtp" not in stage_modules[-1]:
+            stage_modules[-1].append("mtp")
+        return stage_modules
+
+    def get_pipeline_stage_metas(
+        self,
+        *,
+        is_first: bool,
+        microbatch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        """Describe the hidden-state plus rolled-embedding PP tuple contract."""
+        hidden_shape = (microbatch_size, seq_len, self.config.text_config.hidden_size)
+        mtp_depth = int(getattr(self.mtp_config, "num_layers", 0) or 0)
+
+        def meta(shape: tuple[int, ...], *, tensor_dtype: torch.dtype = dtype) -> torch.Tensor:
+            return torch.empty(*shape, device="meta", dtype=tensor_dtype)
+
+        if is_first:
+            inputs_meta = (meta((microbatch_size, seq_len), tensor_dtype=torch.long),)
+        else:
+            inputs_meta = (meta(hidden_shape), *(meta(hidden_shape) for _ in range(mtp_depth)))
+
+        primary_shape = (
+            (microbatch_size, seq_len, self.config.text_config.vocab_size)
+            if self.lm_head is not None
+            else hidden_shape
+        )
+        outputs_meta = (meta(primary_shape), *(meta(hidden_shape) for _ in range(mtp_depth)))
+        return inputs_meta, outputs_meta
+
+    def _is_pipeline_parallel_stage(self) -> bool:
+        language_model = getattr(self.model, "language_model", None)
+        if language_model is None:
+            return False
+        if self.lm_head is None or getattr(language_model, "embed_tokens", None) is None:
+            return True
+        try:
+            return len(language_model.layers) != int(self.config.text_config.num_hidden_layers)
+        except TypeError:
+            return False
+
     def _pop_staged_vlm_media(
         self,
         input_ids: torch.Tensor | None,
@@ -1032,6 +1085,7 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
+        *mtp_embed_inputs: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: Any | None = None,
@@ -1092,11 +1146,23 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
         # Detect a split stage and (a) on non-first stages feed the upstream hidden
         # states straight into the text backbone, (b) on non-last stages return raw
         # hidden states for the next stage, (c) run lm_head only where it survives.
-        # MTP needs embed_tokens (absent past stage 0) so it is skipped under PP.
         language_model = self.model.language_model
         is_first_stage = getattr(language_model, "embed_tokens", None) is not None
         is_last_stage = getattr(self, "lm_head", None) is not None
+        is_pp_stage = self._is_pipeline_parallel_stage()
+        pp_mtp_enabled = is_pp_stage and self.mtp_config.enabled
         if not (is_first_stage and is_last_stage):
+            source_input_ids = None
+            source_embeds = None
+            if pp_mtp_enabled and is_first_stage and not mtp_embed_inputs:
+                if inputs_embeds is not None:
+                    source_embeds = inputs_embeds
+                elif input_ids is not None and torch.is_floating_point(input_ids):
+                    source_embeds = input_ids
+                    inputs_embeds = input_ids
+                    input_ids = None
+                else:
+                    source_input_ids = input_ids
             if is_first_stage:
                 outputs = self.model(
                     input_ids=input_ids,
@@ -1112,6 +1178,17 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                     **model_kwargs,
                 )
                 hidden_states = outputs.last_hidden_state
+                if pp_mtp_enabled and not mtp_embed_inputs:
+                    if source_embeds is None:
+                        if source_input_ids is None:
+                            raise ValueError(
+                                "First Qwen3.5 PP stage requires input_ids or inputs_embeds "
+                                "to build MTP embeddings"
+                            )
+                        source_embeds = language_model.embed_tokens(source_input_ids)
+                    mtp_embed_inputs = _rolled_embed_inputs(
+                        source_embeds, self.mtp_config.num_layers
+                    )
             else:
                 # The PP schedule passes the upstream stage's hidden states in the
                 # input_ids slot (a float tensor) or as inputs_embeds.
@@ -1127,8 +1204,66 @@ class Qwen3_5ForConditionalGeneration(HFCheckpointingMixin, HFQwen3_5ForConditio
                 )
                 hidden_states = getattr(text_out, "last_hidden_state", text_out)
             if not is_last_stage:
+                if pp_mtp_enabled:
+                    return (hidden_states, *mtp_embed_inputs)
                 return hidden_states
-            return self.lm_head(hidden_states)
+
+            logits = self.lm_head(hidden_states)
+            if not pp_mtp_enabled:
+                return logits
+            if self.mtp is None:
+                raise ValueError("Final Qwen3.5 PP stage does not own the enabled MTP module")
+            if len(mtp_embed_inputs) != self.mtp_config.num_layers:
+                raise ValueError(
+                    "Final Qwen3.5 PP stage requires one propagated embedding per MTP depth; "
+                    f"got {len(mtp_embed_inputs)} for {self.mtp_config.num_layers} depths"
+                )
+
+            rotary_position_ids, text_position_ids = _split_qwen3_5_position_ids(
+                position_ids,
+                batch_size=hidden_states.shape[0],
+                seq_len=hidden_states.shape[1],
+                device=hidden_states.device,
+                past_key_values=past_key_values,
+            )
+            packing_mask = (
+                attention_mask
+                if is_indexed_packed_mask(attention_mask)
+                else model_kwargs.get("_packed_seq_ids")
+            )
+            if is_indexed_packed_mask(packing_mask):
+                causal_mask = _mtp_block_causal_mask(packing_mask, mtp_embed_inputs[0])
+            else:
+                causal_mask = create_causal_mask(
+                    config=language_model.config,
+                    inputs_embeds=mtp_embed_inputs[0],
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    position_ids=text_position_ids,
+                )
+            mtp_kwargs = {
+                key: value
+                for key, value in model_kwargs.items()
+                if key
+                not in {
+                    "cache_position",
+                    "cu_seqlens",
+                    "cu_seqlens_padded",
+                    "max_seqlen",
+                    "mm_token_type_ids",
+                    "padding_mask",
+                    "qkv_format",
+                }
+            }
+            mtp_per_depth_h = self.mtp(
+                hidden_states,
+                embed_inputs=tuple(mtp_embed_inputs),
+                position_ids=rotary_position_ids,
+                attention_mask=causal_mask,
+                rotary_emb=language_model.rotary_emb,
+                **mtp_kwargs,
+            )
+            return (logits, *mtp_per_depth_h)
 
         outputs = self.model(
             input_ids=input_ids,

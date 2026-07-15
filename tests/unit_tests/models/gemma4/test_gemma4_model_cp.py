@@ -505,7 +505,8 @@ def test_get_capabilities_moe_supports_cp_and_ep():
     caps = Gemma4ForConditionalGeneration.get_capabilities(_cfg(enable_moe_block=True))
     assert caps.supports_cp is True
     assert caps.supports_ep is True
-    assert caps.supports_tp is False
+    assert caps.supports_tp is True
+    assert caps.supports_pp is True
 
 
 # ---------------------------------------------------------------------------

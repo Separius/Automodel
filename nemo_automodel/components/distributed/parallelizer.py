@@ -332,7 +332,11 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                     )
                     parallelize_module(model, tp_mesh, model_parallel_plan)
                 if _attention_is_head_sharded(model_parallel_plan):
-                    _update_attention_head_counts_for_tp(model, tp_mesh.size())
+                    _update_attention_head_counts_for_tp(
+                        model,
+                        tp_mesh.size(),
+                        tp_group=tp_mesh.get_group(),
+                    )
 
             if enable_async_tensor_parallel:
                 torch._inductor.config._micro_pipeline_tp = True
@@ -349,6 +353,12 @@ class DefaultParallelizationStrategy(ParallelizationStrategy):
                         logger.info(f"Symmetric memory enabled for TP group '{tp_group_name}'")
                     except Exception as e:
                         logger.warning(f"Could not enable symmetric memory for TP group: {e}")
+
+        cp_mesh_name = dp_shard_cp_mesh_name.replace("dp_shard_", "")
+        if cp_mesh_name in device_mesh.mesh_dim_names:
+            cp_mesh = device_mesh[cp_mesh_name]
+            if cp_mesh.size() > 1:
+                _configure_attention_backends_for_cp(model, cp_mesh)
 
         # Apply activation checkpointing to transformer blocks if requested
         if activation_checkpointing:
@@ -1349,7 +1359,14 @@ def _attention_is_head_sharded(model_parallel_plan: dict) -> bool:
     on fused QKV and ``Replicate`` output) should *not* trigger a head-count
     update.
     """
-    attn_proj_suffixes = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.qkv_proj")
+    attn_proj_suffixes = (
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.qkv_proj",
+        "self_attn.q_b_proj",
+        "self_attn.kv_b_proj",
+    )
     for key, style in model_parallel_plan.items():
         if not any(key.endswith(s) for s in attn_proj_suffixes):
             continue
@@ -1365,7 +1382,43 @@ def _attention_is_head_sharded(model_parallel_plan: dict) -> bool:
     return False
 
 
-def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None:
+def _configure_attention_backends_for_cp(model: nn.Module, cp_mesh: DeviceMesh) -> None:
+    """Attach a context-parallel mesh to reusable attention backend modules.
+
+    Native model families commonly keep the actual kernel module in an
+    ``attn_module`` attribute while exposing a bound ``attn_func`` callable.
+    Configure that backend once in the shared parallelizer so each family does
+    not need a copy of the Transformer Engine wiring.
+    """
+
+    if cp_mesh.size() <= 1:
+        return
+    cp_group = cp_mesh.get_group()
+    cp_ranks = torch.distributed.get_process_group_ranks(cp_group)
+    cp_stream = torch.cuda.Stream()
+    configured: set[int] = set()
+    for module in model.modules():
+        backend = getattr(module, "attn_module", None)
+        if backend is None or id(backend) in configured:
+            continue
+        setter = getattr(backend, "set_context_parallel_group", None)
+        if not callable(setter):
+            continue
+        setter(
+            cp_group,
+            cp_ranks,
+            cp_stream,
+            cp_comm_type="p2p",
+        )
+        configured.add(id(backend))
+
+
+def _update_attention_head_counts_for_tp(
+    model: nn.Module,
+    tp_size: int,
+    *,
+    tp_group=None,
+) -> None:
     """
     After TP sharding, the Q/K/V outputs are split across ranks (each rank has
     num_heads/tp_size heads). Update the config and each attention layer's
@@ -1374,6 +1427,32 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
     """
     if tp_size <= 1:
         return
+
+    # Kernel backends are initialized before the distributed mesh exists. Keep
+    # their per-partition geometry synchronized with the now-sharded Q/K/V
+    # projections, independently of where a family stores its text config.
+    configured: set[int] = set()
+    for module in model.modules():
+        backend = getattr(module, "attn_module", None)
+        if backend is None or id(backend) in configured:
+            continue
+        num_gqa_groups = getattr(backend, "num_gqa_groups", None)
+        if num_gqa_groups is None:
+            continue
+        if int(num_gqa_groups) % int(tp_size):
+            raise ValueError(
+                f"attention backend num_gqa_groups={num_gqa_groups} is not divisible "
+                f"by tp_size={tp_size}"
+            )
+        backend.tp_size = int(tp_size)
+        backend.tp_group = tp_group
+        backend.num_gqa_groups_per_partition = int(num_gqa_groups) // int(tp_size)
+        if hasattr(backend, "num_attention_heads_per_partition"):
+            backend.num_attention_heads_per_partition = (
+                int(backend.num_attention_heads) // int(tp_size)
+            )
+        configured.add(id(backend))
+
     config = getattr(model, "config", None)
     if config is None or not hasattr(config, "num_attention_heads"):
         return
@@ -1401,6 +1480,9 @@ def _update_attention_head_counts_for_tp(model: nn.Module, tp_size: int) -> None
     for layer in layer_iter:
         if hasattr(layer, "self_attn"):
             attn = layer.self_attn
+            if hasattr(attn, "set_tensor_parallel_size"):
+                attn.set_tensor_parallel_size(tp_size)
+                continue
             if hasattr(attn, "num_heads"):
                 attn.num_heads = local_num_attention_heads
             if hasattr(attn, "num_key_value_heads"):

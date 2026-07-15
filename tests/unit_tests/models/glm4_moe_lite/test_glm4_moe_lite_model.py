@@ -25,6 +25,13 @@ from nemo_automodel.components.models.glm4_moe_lite.model import (
     Glm4MoeLiteModel,
     ModelClass,
 )
+from nemo_automodel.components.distributed.optimized_tp_plans import (
+    _parallelize_glm4_moe_lite,
+)
+from nemo_automodel.components.distributed.parallelizer import (
+    _attention_is_head_sharded,
+    _update_attention_head_counts_for_tp,
+)
 from nemo_automodel.components.moe.layers import MLP, MoE, MoEConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -125,6 +132,46 @@ def make_moe_config(config: MockGlm4MoeLiteConfig) -> MoEConfig:
         expert_activation="swiglu",
         softmax_before_topk=False,
     )
+
+
+def test_glm4_moe_lite_declares_native_tp_cp_pp_and_ep() -> None:
+    caps = Glm4MoeLiteForCausalLM.ModelCapabilities()
+
+    assert caps.supports_tp
+    assert caps.supports_cp
+    assert caps.supports_pp
+    assert caps.supports_ep
+
+
+def test_glm4_moe_lite_native_tp_plan_shards_decoded_mla_heads_only(
+    config, backend_config
+) -> None:
+    model = Glm4MoeLiteForCausalLM(config, backend=backend_config)
+
+    plan = _parallelize_glm4_moe_lite(model)
+
+    assert set(plan) >= {
+        "model.embed_tokens",
+        "model.layers.*.self_attn.q_b_proj",
+        "model.layers.*.self_attn.kv_b_proj",
+        "model.layers.*.self_attn.o_proj",
+        "model.layers.*.mlp.gate_proj",
+        "model.layers.*.mlp.up_proj",
+        "model.layers.*.mlp.down_proj",
+        "lm_head",
+    }
+    assert "model.layers.*.self_attn.kv_a_proj_with_mqa" not in plan
+    assert _attention_is_head_sharded(plan)
+
+
+def test_glm4_moe_lite_tp_head_update_uses_local_mla_head_count(
+    config, backend_config
+) -> None:
+    model = Glm4MoeLiteForCausalLM(config, backend=backend_config)
+
+    _update_attention_head_counts_for_tp(model, tp_size=2)
+
+    assert all(layer.self_attn.n_heads == 2 for layer in model.model.layers.values())
 
 
 class TestBlock:
